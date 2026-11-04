@@ -1,0 +1,6 @@
+# 桥运行时产生的私人数据，绝不要提交进仓库
+telegram-bridge/config.json
+telegram-bridge/state/
+telegram-bridge/archive/
+*.log
+__pycache__/

@@ -1,0 +1,1 @@
+{"auto_reset":{"daily_at":"04:00","idle_hours":0},"features":{"activation_toggle":false,"auto_reset":false,"mention_patterns":false,"per_group_policy":false},"groups":{"<YOUR_MULTI_BOT_GROUP_CHAT_ID>":{"allow_from":[],"require_mention":true}},"mention_patterns":[]}

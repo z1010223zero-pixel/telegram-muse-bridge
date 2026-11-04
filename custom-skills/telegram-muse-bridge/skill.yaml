@@ -1,0 +1,5 @@
+name: "telegram-muse-bridge"
+title: "用 Telegram Bot 连接 Muse"
+description: "把 Telegram Bot 接到 Muse 的可复用方法，含自建 Bot、连接器、轮询桥接和白名单，朋友拿到后换成自己的 Bot 即可复用。"
+category: "Work and knowledge"
+include_in_prompt: false
