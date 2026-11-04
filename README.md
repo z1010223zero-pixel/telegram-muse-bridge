@@ -1,5 +1,7 @@
 # Telegram Muse Bridge
 
+> [English README](README_EN.md)
+
 用自建 Telegram Bot 连接 [Muse](https://muse.ai) 个人 AI 助手，在 Telegram 里直接跟你的 Muse 对话。
 
 Bridge your personal Muse AI assistant to Telegram with a bot you own. Tested on a real setup, 2026-11-04.
