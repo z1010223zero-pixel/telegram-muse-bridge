@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -26,6 +27,98 @@ BASE = "https://api.telegram.org/bot{}/"
 # refuse anything over 45 MB client-side.
 TEXT_LIMIT = 4000
 MAX_UPLOAD_BYTES = 45 * 1024 * 1024
+
+# Idempotent sends (ilink retrofit, 2026-11-17): a local ledger of
+# (chat_id, idempotency_key) -> sent message_ids. A repeat send with the
+# same key within 24h returns the stored result without calling the API,
+# so a retry after an ambiguous failure never double-sends. The key is
+# caller-chosen; the bridge passes the source Telegram message_id.
+# Ledger lives outside the workspace so a workspace reset cannot wipe it;
+# override with TELEGRAM_SEND_LEDGER. File is 0600.
+LEDGER_PATH = os.environ.get(
+    "TELEGRAM_SEND_LEDGER",
+    os.path.expanduser("~/.cache/telegram-send-ledger.json"),
+)
+LEDGER_TTL_SECS = 24 * 3600
+LEDGER_MAX_ENTRIES = 200
+
+
+def _ledger_load():
+    try:
+        with open(LEDGER_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("entries"), list):
+            return data["entries"]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def _ledger_save(entries):
+    directory = os.path.dirname(LEDGER_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = LEDGER_PATH + ".tmp." + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"entries": entries}, fh, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, LEDGER_PATH)
+    try:
+        os.chmod(LEDGER_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def _ledger_lookup(chat_id, key):
+    now = time.time()
+    for entry in _ledger_load():
+        if entry.get("chat_id") == str(chat_id) and entry.get("key") == key:
+            if now - entry.get("ts", 0) <= LEDGER_TTL_SECS:
+                return entry
+    return None
+
+
+def _ledger_record(chat_id, key, message_ids):
+    now = time.time()
+    entries = [
+        e
+        for e in _ledger_load()
+        if now - e.get("ts", 0) <= LEDGER_TTL_SECS
+        and not (e.get("chat_id") == str(chat_id) and e.get("key") == key)
+    ]
+    entries.append(
+        {
+            "chat_id": str(chat_id),
+            "key": key,
+            "message_ids": list(message_ids),
+            "ts": now,
+        }
+    )
+    _ledger_save(entries[-LEDGER_MAX_ENTRIES:])
+
+
+def send_message_once(chat_id, payload, idempotency_key=None):
+    """One sendMessage call with optional idempotency.
+
+    With a key, a repeat within 24h returns
+    {"ok": True, "duplicate": True, "message_id": ..., "message_ids": [...]}
+    without touching the API. Without a key, behaves exactly as before.
+    """
+    if idempotency_key:
+        hit = _ledger_lookup(chat_id, idempotency_key)
+        if hit is not None:
+            ids = hit.get("message_ids", [])
+            return {
+                "ok": True,
+                "duplicate": True,
+                "message_id": ids[0] if ids else None,
+                "message_ids": ids,
+            }
+    result = call("sendMessage", payload)
+    if idempotency_key and result.get("ok"):
+        _ledger_record(chat_id, idempotency_key, [result["result"]["message_id"]])
+    return result
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -137,15 +230,23 @@ def split_text(text, limit=TEXT_LIMIT):
     return chunks
 
 
-def send_text(chat_id, text, reply_to_message_id=None):
+def send_text(chat_id, text, reply_to_message_id=None, idempotency_key=None):
     """Send a text message, auto-splitting overlong texts.
 
     Short texts keep the original single sendMessage behaviour and return
     its raw result. Overlong texts are sent chunk by chunk in order and
     return a summary dict {ok, chunks, message_ids}. When
     reply_to_message_id is given, only the first (or only) chunk quotes
-    that message.
+    that message. With idempotency_key, a repeat send within 24h returns
+    the stored result instead of re-sending (single-chunk path; a
+    multi-chunk send records only after ALL chunks succeed, so a retry
+    after a mid-split failure may duplicate already-sent chunks).
     """
+    if idempotency_key and len(text) <= TEXT_LIMIT:
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        return send_message_once(chat_id, payload, idempotency_key)
     chunks = split_text(text, TEXT_LIMIT)
     if len(chunks) <= 1:
         payload = {"chat_id": chat_id, "text": text}
@@ -161,6 +262,8 @@ def send_text(chat_id, text, reply_to_message_id=None):
         if not result.get("ok"):
             raise RuntimeError(f"sendMessage chunk failed: {result}")
         message_ids.append(result["result"]["message_id"])
+    if idempotency_key:
+        _ledger_record(chat_id, idempotency_key, message_ids)
     return {"ok": True, "chunks": len(chunks), "message_ids": message_ids}
 
 
@@ -233,6 +336,9 @@ def main():
     p_send.add_argument("--chat-id", required=True)
     p_send.add_argument("--text", required=True)
     p_send.add_argument("--reply-to-message-id", type=int, default=None)
+    p_send.add_argument("--idempotency-key", default=None,
+                        help="repeat sends with the same key return the "
+                        "stored result instead of re-sending (24h)")
 
     p_action = sub.add_parser("send-chat-action")
     p_action.add_argument("--chat-id", required=True)
@@ -260,6 +366,7 @@ def main():
     p_approval.add_argument("--text", required=True)
     p_approval.add_argument("--approval-id", required=True)
     p_approval.add_argument("--reply-to-message-id", type=int, default=None)
+    p_approval.add_argument("--idempotency-key", default=None)
 
     p_react = sub.add_parser("react")
     p_react.add_argument("--chat-id", required=True)
@@ -297,7 +404,8 @@ def main():
             payload["offset"] = args.offset
         result = call("getUpdates", payload)
     elif args.command == "send-message":
-        result = send_text(args.chat_id, args.text, args.reply_to_message_id)
+        result = send_text(args.chat_id, args.text, args.reply_to_message_id,
+                           args.idempotency_key)
     elif args.command == "send-chat-action":
         result = call(
             "sendChatAction", {"chat_id": args.chat_id, "action": args.action}
@@ -351,7 +459,10 @@ def main():
         }
         if args.reply_to_message_id is not None:
             approval_payload["reply_to_message_id"] = args.reply_to_message_id
-        result = call("sendMessage", approval_payload)
+        result = send_message_once(
+            args.chat_id, approval_payload,
+            args.idempotency_key or f"approval:{args.approval_id}",
+        )
     elif args.command == "react":
         result = call(
             "setMessageReaction",

@@ -20,6 +20,9 @@ Bridge your personal Muse AI assistant to Telegram with a bot you own. Tested on
 - **实时性**：长轮询（`get-updates --timeout 25`，hook 间隔 5 秒），消息到达约 1–2 秒即被带回唤醒；不需要公网入口，不迁 webhook，空轮询不唤醒助手。
 - **相册聚合**：同一 `media_group_id` 的成组照片/视频凑成一轮合并理解、只回复一次。
 - **群与话题**：按 `message_thread_id` 分话题存状态，待办按话题隔离；可指定一个多 bot 协作群为例外（见下文）；策略开关默认全关（按群策略、昵称唤醒、会话级 `/activation`、自动重置会话）。
+- **落盘队列与去重（2026-11-17）**：消息先落盘到 `queue/pending.json` 才推进 offset，唤醒失败下一轮重唤；入站按消息 ID 去重，批次超 600 秒未确认自动重投，状态文件记 `handled_message_ids` 防重复回复，回复前先复查队列合并连发。
+- **发送幂等（2026-11-17）**：`send-message` / `send-approval` 支持 `--idempotency-key`，同一 key 24 小时内重复发送直接返回已存结果、不重复调 API，结果不明时重试也不会发两遍。
+- **warm-wait 连续对话（2026-11-17）**：worker 改为 responder——能直接回的自己回，回完原地守 180 秒（总预算 600 秒），窗口内再发由热 worker 回、省重复冷启动；回调、桥命令、非文字、要查资料/购买/审核/长活的整批升级给主会话。首条仍冷启动。另有看门狗盯轮询心跳，停摆或恢复时才报信。
 
 ## 工作原理
 
@@ -30,7 +33,7 @@ Telegram <── telegram_bot.py (Bot API) ── 回复/发文件/审核按钮 
 ```
 
 - 没有 webhook，不需要公网入口、隧道或额外账号。
-- 轮询脚本只做一件事：拉取更新、保存 offset、把新消息交给助手；空轮询不唤醒、不花额度。
+- 轮询脚本拉取更新、先把新消息落盘进队列、再保存 offset 并唤醒助手；空轮询不唤醒、不花额度。被唤醒的 worker 先整批判断：能直接回的自己回并 warm-wait 等下一句，需要主会话的整批升级、不回不确认。
 - 一个 Bot 同一时间只能接一个 Muse，也只能有一个 `getUpdates` 轮询者在消费消息。不要把同一个 Bot 再接给 OpenClaw 等其他接入。
 
 ## 仓库结构
@@ -47,11 +50,16 @@ Telegram <── telegram_bot.py (Bot API) ── 回复/发文件/审核按钮 
 │   ├── connector.yaml
 │   └── bin/telegram_bot.py                    # Bot API helper：收发消息/媒体/文件/审核/反应/命令菜单
 ├── hooks/
-│   ├── telegram-bridge.template.sh            # 轮询脚本模板（改名、替换占位符后使用）
-│   ├── telegram-bridge.template.json          # hook 定义模板，含完整唤醒规则 1–17
+│   ├── telegram-bridge.template.sh            # 轮询脚本模板（落盘队列版；改名、替换占位符后使用）
+│   ├── telegram-bridge.template.json          # hook 定义模板：responder 提示词（直回 / 升级 / warm-wait）
 │   └── search-history.py                      # 历史检索小工具：按关键词搜状态与归档
 └── telegram-bridge/
-    └── config.template.json                   # 策略开关配置模板，四个功能开关默认全关
+    ├── config.template.json                   # 策略开关配置模板，四个功能开关默认全关
+    └── bin/
+        ├── warm-wait.sh                       # 回完守候下一批（180 秒空闲 / 600 秒总预算）
+        ├── record-state.py                    # 状态记账：handled 去重 + recent_turns
+        ├── ack-batch.sh                       # 批次确认，防 600 秒重投重复处理
+        └── watchdog.sh                        # 轮询心跳看门狗（30 分钟判过期）
 ```
 
 ## 快速开始
@@ -77,10 +85,10 @@ python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/telegram_bot.py se
 
 ### 3. 搭轮询桥接
 
-把 `hooks/` 下的轮询脚本和 hook 定义按模板放好（脚本改名为 `telegram-bridge.sh` 放到 `~/hooks/scripts/` 下），替换模板里的占位符：
+把 `hooks/` 下的轮询脚本和 hook 定义按模板放好（脚本改名为 `telegram-bridge.sh` 放到 `~/hooks/scripts/` 下），再把 `telegram-bridge/bin/` 下四个 helper 放到自己的 `~/workspace/telegram-bridge/bin/` 下，替换模板里的占位符：
 
 - 脚本中的 `YOUR_BOT_USERNAME`（共三处）换成自己 Bot 的用户名；
-- hook 模板中的 `__MULTI_BOT_GROUP_CHAT_ID__` 换成自己的多 bot 协作群群号，不用多 bot 群功能可整段删掉规则 13；
+- hook 模板中的 `__MULTI_BOT_GROUP_CHAT_ID__` 换成自己的多 bot 协作群群号，不用多 bot 群功能可删掉提示词里对应的群策略一句；hook 的 `script_timeout_secs` 保持 600，否则 warm-wait 会被提前掐断；
 - 投递目标按自己 Muse 的会话情况设置。
 
 脚本和 hook 须保存一份 allowlist，**只放自己的 Telegram 用户 ID**。非白名单发来的消息一律不执行，只回一句这是私人 Bot、配对需主人批准，并把对方信息报给主人等批准。
@@ -108,7 +116,7 @@ python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/telegram_bot.py ge
 | --- | --- |
 | `get-me` | 无害读取，确认 Bot 身份 |
 | `get-updates [--offset N] [--timeout S]` | 拉取新消息，支持长轮询 |
-| `send-message --chat-id --text [--reply-to-message-id]` | 发文字，超长自动分段 |
+| `send-message --chat-id --text [--reply-to-message-id] [--idempotency-key]` | 发文字，超长自动分段；带幂等 key 时 24 小时内不重发 |
 | `send-chat-action --chat-id` | 发 typing 在场感 |
 | `edit-message --chat-id --message-id --text` | 改写已发消息（进度更新、完成标记） |
 | `send-file / send-photo-file --chat-id --path [--caption]` | 发文件 / 发图片（>45 MB 直接拒绝） |
@@ -132,7 +140,7 @@ python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/telegram_bot.py ge
 
 - 普通群里 Bot 不是管理员时，Telegram 只送达命令、回复 Bot 本人的消息和系统消息，纯文字 @ 不送达。**要在群里用 @ 唤醒，先把 Bot 设为群管理员。**
 - 给 Bot 设管理员等操作会触发 Telegram 把普通群自动升级为超级群，`chat_id` 随之改变：hook 规则里写死的群号（多 bot 协作群那条）和对应的 per-chat 状态文件名都要同步改成新群号，旧群号发消息会直接报错。
-- 多 bot 协作群（规则 13）只放开指定的一个群、只放开 bot 发送者，带四条护栏：bot 的话不算主人指令、无真人介入时连聊最多 3 轮、不回复自己、群里真人非白名单成员仍不执行。**不用这个功能就把规则 13 整段删掉。**
+- 多 bot 协作群只放开指定的一个群、只放开 bot 发送者，带四条护栏：bot 的话不算主人指令、无真人介入时连聊最多 3 轮、不回复自己、群里真人非白名单成员仍不执行。**不用这个功能就删掉提示词里对应的群策略一句。**
 
 ## 限制与常见问题
 
@@ -142,6 +150,7 @@ python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/telegram_bot.py ge
 - 错误类回复按 chat 冷却 60 秒，避免刷屏；只读查询类失败可重试一次。
 - 上下文按 token 封顶：recent 内容估算超过约 24000 token 时触发滚动摘要、保留尾部约 8000 token（不多于最近 12 轮）；触发前先把耐久事实 flush 进当天记忆日记的「Telegram 桥 flush」小节。
 - 历史检索：`/new`、`/reset` 前先把当前会话快照归档到 `archive/<chat_id>/<session_id>.json`，用 `hooks/search-history.py <关键词>` 检索全部状态与归档。
+- warm-wait 只省连续对话的重复冷启动，首条仍要冷启动；worker 会话寿命实测上限约 600 秒，所以总预算只给 600 秒，超时靠队列重投与幂等账本兜底，消息不丢、也不会重发。
 
 ## 里面没有、也不要发的东西
 

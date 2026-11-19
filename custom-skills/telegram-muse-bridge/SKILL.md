@@ -80,6 +80,25 @@
 - **新媒体与服务消息**：脚本新增识别 sticker（file_id/emoji/set_name）、animation、video_note，视同照片下载处理；服务消息识别为 `media_kind: "service"` 并带 `service_kind` 与新成员名单，只记录不回复、不再发“未读到文字”澄清（唯一例外：bot 被主人拉进新群时问候一句）。
 - **策略开关（默认全关）**：桥目录下 `telegram-bridge/config.json`（权限 0600）保存 `features` 四个开关（per_group_policy、mention_patterns、activation_toggle、auto_reset）、`groups` 按群配置（require_mention、allow_from）、`mention_patterns`、`auto_reset`（daily_at、idle_hours）。唤醒规则先读 config：开关为 false 时行为与无此机制时完全一致；只有主人明确要求并确认后才把开关改 true 启用。朋友复用时把 config 里的群号换成自己的。
 
+## 改造记录（2026-11-17，学 wechat-ilink-muse-bridge）
+
+2026-11-17 主人让学 ilink 桥的优点改造自家桥。以下已落地（脚本、helper、skill 三处一致）：
+
+- **落盘队列（at-least-once）**：轮询脚本 `~/hooks/scripts/telegram-bridge.sh` 每轮先把新消息/回调落盘到 `~/workspace/telegram-bridge/queue/pending.json`（batch，含 batch_id、landed_at、woken_at、status、messages、callbacks），落盘成功才推 offset；wake 失败的批次留在队列里，下一轮重唤。wake 前先把批次标成 inflight——注意 `wake()` 成功时直接退出进程，wake 之后的代码不会跑，所以标 inflight 必须在 wake 之前；wake 发不出去才回滚成 queued。
+- **入站去重**：`queue/seen.json` 记最近 500 个 `m:<chat_id>:<message_id>` / `cb:<callback_id>`，重投的 update 直接丢弃、不进队列。
+- **重投回收**：inflight 超过 600 秒没被 ack 就回队列重唤。主会话处理完一批后必须跑 `~/workspace/telegram-bridge/bin/ack-batch.sh <batch_id>...`（batch_id 在 wake payload 里），否则 10 分钟后会收到重复投递。
+- **主会话去重**：per-chat 状态文件新增 `handled_message_ids`（最近 50 条 `m:<chat_id>:<message_id>`）。收到一批消息先对一下：已在里面的直接跳过、不再回复；回复完把新处理过的 id 追加进去（超 50 条截断）。这是重投回收的另一半防线。
+- **回复前复查队列**：主会话发 Telegram 回复之前，先读 `queue/pending.json`，看同一聊天有没有刚落地的新消息（queued 或 inflight 的别的批次）：有就合并进这一条回复里，只回一条；没有才按原样发。不要为了等合并而延迟唤醒。
+- **发送幂等**：`telegram_bot.py` 的 `send-message` / `send-approval` 支持 `--idempotency-key`；账本在 `~/.cache/telegram-send-ledger.json`（0600，24 小时有效、上限 200 条）。主会话发 Telegram 回复时 key 传 `reply:<chat_id>:<首条来源 message_id>`；send-approval 默认 key 就是 `approval:<approval-id>`，不用另传。同一 key 24 小时内重复发送直接返回已存的 message_id，不再调 API。注意多段长消息只在全部段成功后才记账，中途失败重试可能重发已发出的段。
+- **看门狗**：轮询脚本每次成功 fetch 都 touch `queue/heartbeat.json`；`~/workspace/telegram-bridge/bin/watchdog.sh` 判 30 分钟过期，cron 每 30 分钟跑一次，只在 STALE / RECOVERED 时向主人报，平时静默。
+- **warm-wait（2026-11-17 晚，主人回“动”后搬过来）**：worker 从 thin relay 改成 responder——先读 `config.json` 的群规矩 + 各聊天状态文件，再整批决定回还是升级：直接回的自己发消息（`telegram_bot.py send-message`，key 为 `reply:<chat_id>:<message_id>`，群里带 `--reply-to-message-id`），回完记 `handled_message_ids` + `recent_turns`（`bin/record-state.py`，check 先查、record 后记）、再 `ack-batch.sh`；回完直接回复的才进 warm-wait：调 `bin/warm-wait.sh --idle-secs 180 --total-secs 600`，180 秒空闲 / 600 秒总上限内有新批次就接着回（600 秒是实测的 worker 会话寿命上限，见下）。升级（escalate）的整批不回、不等、不 ack，原样 summary 交主会话（老 thin relay 路径）：批里有任何回调、/ 命令、非文字消息、要翻墙查资料/购买/审核/长活的，都整批升级。轮询脚本改动：warm marker（`queue/warm.json`，worker_id + started_at + last_heartbeat）新鲜（<60 秒）时只落盘不唤醒，warm worker 自己领 queued 批次（领走时标 inflight）；marker 陈旧/缺失就正常唤醒。worker 死在半路也不丢消息：批次一直 queued 到被 ack，600 秒重投照常；marker 最多被多认约 85 秒（轮询脚本的 now_s 是本轮开始时取的，长轮询 25 秒后才走到判断）。
+  回滚（thin relay）：`hooks.update` 把 prompt 换回 `~/workspace/telegram-bridge/archive/thin-relay-prompt-2026-11-17.txt` 的内容；轮询脚本换回 `~/hooks/scripts/telegram-bridge.sh.bak-20261117-warmwait`（先写 /tmp 副本、`bash -n`、再 `mv` 原子替换，绝不能 `cp` 覆盖——2026-11-17 晚有人 `cp` 覆盖导致一轮 `line 72: file: unbound variable` 失败，下一轮自愈、没丢消息）；删 `queue/warm.json`。
+
+**没移植的（有原因）**：
+- **warm-wait**：已搬（见上）。首条仍冷启动；升级类工作仍走主会话。实测寿命（2026-11-17 晚，探针 hook 已删）：worker 单次 sleep 200 秒能活（207 秒完成）；单次 sleep 900 秒没活下来；真实模式（6 次独立的 sleep 150 秒调用）死在第 4 轮、心跳停在启动后 458 秒——hook worker 会话寿命上限约 600 秒。所以总预算只给 600 秒（180 秒空闲不变），超过就靠优雅降级：marker 变陈旧、轮询恢复唤醒、批次 600 秒重投、发送幂等账本防重发，消息不丢。
+- **落地即亮 typing**：主人 2026-11-09 否掉过“先回收到 / typing 占位”，2026-11-17 又改口让做（“typing 占位的也做”）。已做：轮询脚本落盘后立即给 batch 里的每个聊天发一次 typing（best-effort，不阻塞唤醒）；主会话开始处理时再亮一次。typing 服务端约 5 秒过期，亮了不等于回得快，只是让对方看到机器人活着，别把它当真方案。
+- **daemon.py 常驻进程**：Muse 运行时已有 hook 调度，不需要再养一个进程；hook 每 5 秒一轮 + 25 秒长轮询，收消息已是秒级。
+
 ## 分享时发什么，不发什么
 
 - 可以发：这个 Skill、连接器文件夹、轮询脚本和 hook 定义的模板。

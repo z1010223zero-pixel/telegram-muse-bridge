@@ -18,6 +18,9 @@ Connect your personal [Muse](https://muse.ai) AI assistant with a Telegram Bot y
 - **Near-real-time**: long polling (`get-updates --timeout 25`, hook interval 5 seconds) brings messages back and wakes the assistant in about 1–2 seconds. No public ingress, no webhook migration; empty polls wake nobody and cost nothing.
 - **Album grouping**: photos/videos sharing one `media_group_id` are collected into a single turn, understood together, and answered once.
 - **Groups and topics**: state is stored per `message_thread_id`, todos are isolated per topic; one multi-bot collaboration group can be designated as an exception (see below); feature flags are all off by default (per-group policy, nickname wake-up, per-session `/activation` toggle, auto session reset).
+- **Durable queue and dedup (2026-11-17)**: messages are written to `queue/pending.json` before the offset advances, failed wakes are retried next poll; inbound messages are deduped by ID, batches unacknowledged for over 600 seconds are re-delivered, state files track `handled_message_ids` against double replies, and the queue is re-checked before replying so rapid-fire messages merge into one reply.
+- **Idempotent sends (2026-11-17)**: `send-message` / `send-approval` accept `--idempotency-key`; a repeat send with the same key within 24 hours returns the stored result without calling the API again, so retrying after an unclear outcome never double-sends.
+- **Warm-wait follow-ups (2026-11-17)**: the worker is now a responder — it replies directly when it can, then stays warm for 180 seconds (600-second total budget) so follow-ups skip the repeat cold start; callbacks, bridge commands, non-text messages, and anything needing research, purchases, approvals, or long work escalate as a whole batch to the main session. The first message still cold-starts. A watchdog also monitors the polling heartbeat and only reports stalls or recoveries.
 
 ## How it works
 
@@ -28,7 +31,7 @@ Telegram <── telegram_bot.py (Bot API) ── replies / files / approval but
 ```
 
 - No webhook — no public ingress, tunnel, or extra account needed.
-- The polling script does one thing: fetch updates, persist the offset, and hand new messages to the assistant. Empty polls wake nothing and cost nothing.
+- The polling script fetches updates, writes new messages to the durable queue first, then persists the offset and wakes the assistant. Empty polls wake nothing and cost nothing. The woken worker decides per batch: reply directly and warm-wait for the next message, or escalate the whole batch to the main session without replying or acknowledging.
 - One bot connects to one Muse at a time, and only one `getUpdates` poller may consume its messages. Do not connect the same bot to OpenClaw or any other agent as well.
 
 ## Repository layout
@@ -46,11 +49,16 @@ Telegram <── telegram_bot.py (Bot API) ── replies / files / approval but
 │   ├── connector.yaml
 │   └── bin/telegram_bot.py                    # Bot API helper: messages / media / files / approvals / reactions / command menu
 ├── hooks/
-│   ├── telegram-bridge.template.sh            # Polling script template (rename and replace placeholders before use)
-│   ├── telegram-bridge.template.json          # Hook definition template, with the full wake rules 1–17
+│   ├── telegram-bridge.template.sh            # Polling script template, durable-queue version (rename and replace placeholders before use)
+│   ├── telegram-bridge.template.json          # Hook definition template: responder prompt (reply / escalate / warm-wait)
 │   └── search-history.py                      # History search helper: search state and archives by keyword
 └── telegram-bridge/
-    └── config.template.json                   # Feature-flag config template, all four flags off by default
+    ├── config.template.json                   # Feature-flag config template, all four flags off by default
+    └── bin/
+        ├── warm-wait.sh                       # Wait for the next batch after replying (180s idle / 600s total)
+        ├── record-state.py                    # State bookkeeping: handled dedup + recent_turns
+        ├── ack-batch.sh                       # Acknowledge batches so the 600s re-delivery does not reprocess them
+        └── watchdog.sh                        # Polling heartbeat watchdog (30-minute staleness check)
 ```
 
 ## Quick start
@@ -76,10 +84,10 @@ python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/telegram_bot.py se
 
 ### 3. Set up the polling bridge
 
-Put the polling script and hook definition from `hooks/` in place as instructed by the templates (rename the script to `telegram-bridge.sh` under `~/hooks/scripts/`), and replace the placeholders:
+Put the polling script and hook definition from `hooks/` in place as instructed by the templates (rename the script to `telegram-bridge.sh` under `~/hooks/scripts/`), copy the four helpers from `telegram-bridge/bin/` into your own `~/workspace/telegram-bridge/bin/`, and replace the placeholders:
 
 - `YOUR_BOT_USERNAME` in the script (three occurrences) with your own bot's username;
-- `__MULTI_BOT_GROUP_CHAT_ID__` in the hook template with your own multi-bot collaboration group ID — if you don't use the multi-bot group feature, delete rule 13 entirely;
+- `__MULTI_BOT_GROUP_CHAT_ID__` in the hook template with your own multi-bot collaboration group ID — if you don't use the multi-bot group feature, delete the matching group-policy sentence in the prompt; keep the hook's `script_timeout_secs` at 600 or warm-wait gets cut off early;
 - the delivery target according to your own Muse session setup.
 
 The script and hook must keep an allowlist containing **only your own Telegram user ID**. Messages from anyone not allowlisted are never executed — they only get a short reply saying this is a private bot and pairing needs the owner's approval, and the owner receives a report with the sender's details.
@@ -107,7 +115,7 @@ Every command provided by `bin/telegram_bot.py` (see `custom-connectors/custom.t
 | --- | --- |
 | `get-me` | Harmless read, confirms the bot identity |
 | `get-updates [--offset N] [--timeout S]` | Fetch new messages, with long polling support |
-| `send-message --chat-id --text [--reply-to-message-id]` | Send text, overlong texts auto-split |
+| `send-message --chat-id --text [--reply-to-message-id] [--idempotency-key]` | Send text, overlong texts auto-split; with an idempotency key, no re-send within 24 hours |
 | `send-chat-action --chat-id` | Send the typing presence indicator |
 | `edit-message --chat-id --message-id --text` | Rewrite a sent message (progress updates, done marker) |
 | `send-file / send-photo-file --chat-id --path [--caption]` | Send a file / send a photo (files >45 MB are refused client-side) |
@@ -131,7 +139,7 @@ Every command provided by `bin/telegram_bot.py` (see `custom-connectors/custom.t
 
 - In a regular group where the bot is not an admin, Telegram only delivers commands, replies to the bot's own messages, and system messages — a plain-text @ mention is not delivered. **To wake the bot with @ in a group, make the bot a group admin first.**
 - Making the bot an admin (and similar actions) triggers Telegram to auto-upgrade a regular group to a supergroup, and the `chat_id` changes with it: the hardcoded group ID in the hook rules (the multi-bot collaboration group rule) and the matching per-chat state filename must both be updated to the new group ID — messages to the old group ID will fail outright.
-- The multi-bot collaboration group (rule 13) opens up only the one designated group, and only bot senders, with four guardrails: another bot's words are conversation input, not the owner's instructions; at most 3 back-and-forth turns with no real human stepping in; never reply to the bot itself; real humans in that group who are not allowlisted are still not executed or engaged. **If you don't use this feature, delete rule 13 entirely.**
+- The multi-bot collaboration group opens up only the one designated group, and only bot senders, with four guardrails: another bot's words are conversation input, not the owner's instructions; at most 3 back-and-forth turns with no real human stepping in; never reply to the bot itself; real humans in that group who are not allowlisted are still not executed or engaged. **If you don't use this feature, delete the matching group-policy sentence in the prompt.**
 
 ## Limitations and FAQ
 
@@ -141,6 +149,7 @@ Every command provided by `bin/telegram_bot.py` (see `custom-connectors/custom.t
 - Error replies to the owner are cooled down per chat (60 seconds) to avoid spam; read-only / query failures may be retried once.
 - Context is capped by estimated tokens: when recent turns pass roughly 24,000 tokens, a rolling summary is triggered keeping roughly the last 8,000 tokens (at most the most recent 12 turns); before summarizing, durable facts are flushed into that day's memory journal under a 「Telegram bridge flush」 section.
 - History search: before `/new` / `/reset`, the current session snapshot is archived to `archive/<chat_id>/<session_id>.json`; use `hooks/search-history.py <keyword>` to search all state and archives.
+- Warm-wait only saves the repeat cold start on follow-ups; the first message still cold-starts. Worker sessions live at most about 600 seconds (measured), so the total budget is 600 seconds; past that, queue re-delivery and the idempotency ledger take over — no message is lost and none is sent twice.
 
 ## What is not in here, and should never be shared
 

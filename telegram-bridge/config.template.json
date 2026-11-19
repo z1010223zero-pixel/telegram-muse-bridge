@@ -1,1 +1,27 @@
-{"auto_reset":{"daily_at":"04:00","idle_hours":0},"features":{"activation_toggle":false,"auto_reset":false,"mention_patterns":false,"per_group_policy":false},"groups":{"<YOUR_MULTI_BOT_GROUP_CHAT_ID>":{"allow_from":[],"require_mention":true}},"mention_patterns":[]}
+{
+  "auto_reset": {
+    "daily_at": "04:00",
+    "idle_hours": 0
+  },
+  "features": {
+    "activation_toggle": false,
+    "auto_reset": false,
+    "mention_patterns": false,
+    "per_group_policy": false
+  },
+  "groups": {
+    "__MULTI_BOT_GROUP_CHAT_ID__": {
+      "allow_from": [],
+      "require_mention": true,
+      "bot_guardrails": {
+        "bots_are_input_only": true,
+        "no_owner_actions_from_bots": true,
+        "max_bot_rounds_without_human": 3,
+        "no_reply_to_pure_echo": true,
+        "never_reply_to_self": true,
+        "group_only": true
+      }
+    }
+  },
+  "mention_patterns": []
+}

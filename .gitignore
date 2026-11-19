@@ -4,3 +4,5 @@ telegram-bridge/state/
 telegram-bridge/archive/
 *.log
 __pycache__/
+telegram-bridge/queue/
+telegram-bridge/media/
